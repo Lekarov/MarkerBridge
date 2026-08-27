@@ -30,7 +30,7 @@ NOM_LOGICIEL = "MarkerBridge"
 NOM_EDITEUR = "DoktorP3st"
 
 # Version du logiciel (semver, gérée à la main au fil des évolutions).
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 # Lien vers le profil GitHub de l'auteur, affiché dans la fenêtre Paramètres de la GUI.
 URL_GITHUB_AUTEUR = "https://github.com/Lekarov"
@@ -198,6 +198,19 @@ def extraire_infos_media(chemin_ffprobe, chemin_fichier):
     if fps_reel <= 0:
         raise RuntimeError(f"Framerate invalide pour '{chemin_fichier}'.")
 
+    # Détection d'une cadence variable (VFR) : la conversion secondes -> frames
+    # suppose une cadence constante. Si avg_frame_rate s'écarte nettement de
+    # r_frame_rate, les marqueurs dériveraient — on le signale à l'appelant
+    # (traiter_fichier journalise un avertissement) plutôt que d'échouer,
+    # car OBS produit normalement du CFR.
+    cadence_variable = False
+    try:
+        fps_moyen = float(Fraction(flux_video.get("avg_frame_rate", fraction_brute)))
+        if fps_moyen > 0:
+            cadence_variable = abs(fps_moyen - fps_reel) / fps_reel > 0.001
+    except (ValueError, ZeroDivisionError):
+        pass
+
     timebase = round(fps_reel)
     # Les cadences NTSC (29.97, 59.94, 23.976...) ne sont pas des entiers exacts :
     # Premiere doit alors utiliser un timebase arrondi + le flag NTSC=TRUE.
@@ -208,8 +221,31 @@ def extraire_infos_media(chemin_ffprobe, chemin_fichier):
     if not largeur or not hauteur:
         raise RuntimeError(f"Résolution vidéo introuvable pour '{chemin_fichier}'.")
 
-    duree_sec = float(donnees.get("format", {}).get("duration", 0))
-    if duree_sec <= 0:
+    # Durée du clip matte : priorité au décompte de frames du flux vidéo
+    # (nb_frames, exact, aucun arrondi), sinon la durée du flux vidéo.
+    # format.duration en dernier recours seulement : c'est la durée du
+    # conteneur entier, généralement calée sur l'audio qu'OBS laisse dépasser
+    # la vidéo de quelques centaines de ms — le matte débordait d'autant.
+    duree_frames = None
+    try:
+        nb_frames_brut = int(flux_video.get("nb_frames", 0))
+        if nb_frames_brut > 0:
+            duree_frames = nb_frames_brut
+    except (TypeError, ValueError):
+        pass
+
+    duree_sec = 0.0
+    for duree_brute in (
+        flux_video.get("duration"),
+        donnees.get("format", {}).get("duration"),
+    ):
+        try:
+            duree_sec = float(duree_brute)
+        except (TypeError, ValueError):
+            continue
+        if duree_sec > 0:
+            break
+    if duree_frames is None and duree_sec <= 0:
         raise RuntimeError(f"Durée vidéo introuvable pour '{chemin_fichier}'.")
 
     flux_audio = next((f for f in flux if f.get("codec_type") == "audio"), None)
@@ -224,9 +260,11 @@ def extraire_infos_media(chemin_ffprobe, chemin_fichier):
         "fps_reel": fps_reel,
         "timebase": timebase,
         "est_ntsc": est_ntsc,
+        "cadence_variable": cadence_variable,
         "largeur": largeur,
         "hauteur": hauteur,
         "duree_sec": duree_sec,
+        "duree_frames": duree_frames,  # None si le conteneur ne fournit pas nb_frames
         "audio": infos_audio,
     }
 
@@ -277,7 +315,11 @@ def construire_xml_marqueurs(nom_sequence, chapitres, infos_media):
     fps_reel = infos_media["fps_reel"]
     timebase = infos_media["timebase"]
     est_ntsc = infos_media["est_ntsc"]
-    duree_totale_frames = max(secondes_vers_frame(infos_media["duree_sec"], fps_reel), 1)
+    # nb_frames du flux vidéo quand disponible (décompte exact, aucun arrondi),
+    # sinon conversion depuis la durée du flux vidéo en secondes.
+    duree_totale_frames = infos_media.get("duree_frames") or max(
+        secondes_vers_frame(infos_media["duree_sec"], fps_reel), 1
+    )
 
     def ajouter_bloc_rate(parent):
         rate = ET.SubElement(parent, "rate")
@@ -442,6 +484,12 @@ def traiter_fichier(
         f"audio={'oui' if infos_media['audio'] else 'non'}, décalage appliqué : "
         f"{decalage_sec:+.2f}s"
     )
+    if infos_media["cadence_variable"]:
+        journaliser(
+            "  ATTENTION : cadence d'images variable détectée (VFR). Le placement des "
+            "marqueurs suppose une cadence constante : ils peuvent dériver. Vérifiez "
+            "les réglages d'enregistrement OBS (CFR recommandé)."
+        )
 
     racine_xml = construire_xml_marqueurs(nom_base, chapitres, infos_media)
 

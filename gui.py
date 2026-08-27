@@ -19,7 +19,7 @@ import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 
 import markerbridge as core
 
@@ -114,11 +114,18 @@ class ApplicationMarqueurs(tk.Tk):
             return {}
 
     def _sauvegarder_config(self):
+        # Décalage persisté en nombre (pas en texte brut) : une saisie invalide
+        # ne doit pas se retrouver figée dans la config.
+        try:
+            decalage = float(self.var_decalage.get().strip().replace(",", "."))
+        except ValueError:
+            decalage = core.DECALAGE_PAR_DEFAUT_SEC
+
         donnees = {
             "dossier_source_stream": self.var_dossier_source_stream.get(),
             "dossier_reception": self.var_dossier_reception.get(),
             "deplacer_apres_copie": self.var_deplacer_apres_copie.get(),
-            "decalage_sec": self.var_decalage.get(),
+            "decalage_sec": decalage,
             "renommage_actif": self.var_renommage_actif.get(),
             "modele_renommage": self.var_modele_renommage.get(),
         }
@@ -402,6 +409,9 @@ class ApplicationMarqueurs(tk.Tk):
         ttk.Button(
             ligne_reception, text="Parcourir...", command=self._choisir_dossier_reception
         ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            ligne_reception, text="Ouvrir", command=self._ouvrir_dossier_reception
+        ).pack(side="left", padx=(8, 0))
 
         ligne_option_deplacer = ttk.Frame(carte_stream, style="Panneau.TFrame")
         ligne_option_deplacer.pack(fill="x", pady=(8, 10))
@@ -457,18 +467,19 @@ class ApplicationMarqueurs(tk.Tk):
         barre_boutons = ttk.Frame(carte_fichiers, style="Panneau.TFrame")
         barre_boutons.pack(fill="x", pady=(0, 10))
 
-        ttk.Button(
-            barre_boutons, text="Ajouter un dossier...", command=self._ajouter_dossier
-        ).pack(side="left")
-        ttk.Button(
-            barre_boutons, text="Ajouter des fichiers...", command=self._ajouter_fichiers
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            barre_boutons, text="Retirer la sélection", command=self._retirer_selection
-        ).pack(side="left", padx=(8, 0))
-        ttk.Button(barre_boutons, text="Vider la liste", command=self._vider_liste).pack(
-            side="left", padx=(8, 0)
-        )
+        # Boutons gardés en attributs pour pouvoir les désactiver pendant une
+        # récupération/conversion/purge (modifier la liste à ce moment-là est
+        # au mieux sans effet, au pire trompeur).
+        self.boutons_liste = []
+        for texte, commande in (
+            ("Ajouter un dossier...", self._ajouter_dossier),
+            ("Ajouter des fichiers...", self._ajouter_fichiers),
+            ("Retirer la sélection", self._retirer_selection),
+            ("Vider la liste", self._vider_liste),
+        ):
+            bouton = ttk.Button(barre_boutons, text=texte, command=commande)
+            bouton.pack(side="left", padx=(0 if not self.boutons_liste else 8, 0))
+            self.boutons_liste.append(bouton)
 
         zone_liste = ttk.Frame(carte_fichiers, style="Panneau.TFrame")
         zone_liste.pack(fill="both", expand=True)
@@ -700,6 +711,17 @@ class ApplicationMarqueurs(tk.Tk):
             self.var_dossier_reception.set(dossier)
             self._sauvegarder_config()
 
+    def _ouvrir_dossier_reception(self):
+        """Ouvre le dossier de réception dans l'Explorateur Windows."""
+        dossier = self.var_dossier_reception.get().strip()
+        if not dossier or not os.path.isdir(dossier):
+            self._informer_sombre(
+                "Dossier introuvable",
+                "Le dossier de réception n'est pas renseigné ou n'existe pas encore.",
+            )
+            return
+        os.startfile(os.path.normpath(dossier))
+
     def _lancer_recuperation(self):
         if self.recuperation_en_cours or self.conversion_en_cours or self.purge_en_cours:
             return
@@ -708,28 +730,21 @@ class ApplicationMarqueurs(tk.Tk):
         destination = self.var_dossier_reception.get().strip()
 
         if not source or not destination:
-            messagebox.showwarning(
+            self._informer_sombre(
                 "Chemins manquants",
                 "Renseignez le dossier source (PC de stream) et le dossier de réception.",
             )
             return
 
-        if not os.path.isdir(source):
-            messagebox.showerror(
-                "Dossier source introuvable",
-                f"Impossible d'accéder à :\n{source}\n\n"
-                "Vérifiez que le PC de stream est allumé et que le partage réseau "
-                "est accessible.",
-            )
-            return
-
+        # L'accès au dossier source (partage réseau) est vérifié DANS le thread :
+        # un partage SMB injoignable peut mettre plusieurs secondes à répondre,
+        # ce qui gèlerait l'interface si on testait ici.
         os.makedirs(destination, exist_ok=True)
         self._sauvegarder_config()
 
         self.recuperation_en_cours = True
-        self.bouton_recuperer.config(state="disabled")
-        self.bouton_lancer.config(state="disabled")
-        self.label_statut.config(text="Récupération des vidéos en cours...")
+        self._activer_ui(False)
+        self.label_statut.config(text="Vérification de l'accès au PC de stream...")
 
         self.barre_progression_recuperation.config(value=0, maximum=1)
         self.label_progression_recuperation.config(text="Recherche des vidéos à récupérer...")
@@ -738,13 +753,27 @@ class ApplicationMarqueurs(tk.Tk):
         deplacer = self.var_deplacer_apres_copie.get()
         renommage_actif = self.var_renommage_actif.get()
         modele_renommage = self.var_modele_renommage.get().strip() or MODELE_RENOMMAGE_PAR_DEFAUT
-        if renommage_actif and "{n}" not in modele_renommage:
-            modele_renommage = MODELE_RENOMMAGE_PAR_DEFAUT
-            self.var_modele_renommage.set(modele_renommage)
-            self._journaliser(
-                "Règle de renommage invalide (doit contenir {n}), valeur par défaut "
-                f"'{MODELE_RENOMMAGE_PAR_DEFAUT}' utilisée."
-            )
+        if renommage_actif:
+            # Sans {n}, la boucle anti-collision de _renommer_en_partie ne
+            # changerait jamais de nom et tournerait sans fin.
+            if "{n}" not in modele_renommage:
+                modele_renommage = MODELE_RENOMMAGE_PAR_DEFAUT
+                self.var_modele_renommage.set(modele_renommage)
+                self._journaliser(
+                    "Règle de renommage invalide (doit contenir {n}), valeur par défaut "
+                    f"'{MODELE_RENOMMAGE_PAR_DEFAUT}' utilisée."
+                )
+            # Caractères interdits dans un nom de fichier Windows : retirés
+            # silencieusement du modèle, sinon chaque renommage échouerait.
+            modele_nettoye = re.sub(r'[<>:"/\\|?*]', "", modele_renommage)
+            if modele_nettoye != modele_renommage:
+                modele_renommage = modele_nettoye or MODELE_RENOMMAGE_PAR_DEFAUT
+                self.var_modele_renommage.set(modele_renommage)
+                self._journaliser(
+                    "Caractères interdits dans un nom de fichier Windows retirés de "
+                    f"la règle de renommage : '{modele_renommage}'."
+                )
+            self._sauvegarder_config()
 
         thread = threading.Thread(
             target=self._travail_recuperation,
@@ -757,6 +786,11 @@ class ApplicationMarqueurs(tk.Tk):
     # (partage SMB qui se déconnecte/reconnecte brièvement), et délai entre elles.
     NB_TENTATIVES_COPIE = 3
     DELAI_ENTRE_TENTATIVES_SEC = 2
+
+    # Un fichier modifié il y a moins de N secondes est probablement encore en
+    # cours d'enregistrement par OBS : le copier maintenant donnerait une copie
+    # tronquée (et le mode "déplacer" supprimerait l'original incomplet !).
+    AGE_MINIMUM_FICHIER_SEC = 30
 
     def _copier_un_fichier_avec_reprise(self, chemin_source, chemin_destination):
         """Copie un fichier avec reprise automatique sur erreur réseau transitoire.
@@ -861,6 +895,21 @@ class ApplicationMarqueurs(tk.Tk):
         source = os.path.normpath(source)
         destination = os.path.normpath(destination)
 
+        # Test d'accès fait ici (et pas avant de lancer le thread) : sur un
+        # partage réseau injoignable, isdir peut bloquer plusieurs secondes.
+        if not os.path.isdir(source):
+            self.file_attente.put((
+                "erreur",
+                (
+                    "Dossier source introuvable",
+                    f"Impossible d'accéder à :\n{source}\n\n"
+                    "Vérifiez que le PC de stream est allumé et que le partage "
+                    "réseau est accessible.",
+                ),
+            ))
+            self.file_attente.put(("fin_recuperation", []))
+            return
+
         try:
             fichiers_source = core.lister_fichiers_mp4(source)
         except ValueError as erreur:
@@ -871,6 +920,7 @@ class ApplicationMarqueurs(tk.Tk):
         nouveaux_fichiers = []
         nb_ignores = 0
         nb_echecs = 0
+        nb_en_cours_enregistrement = 0
         total_fichiers = len(fichiers_source)
         prochain_numero_partie = (
             self._prochain_numero_partie(destination, modele_renommage)
@@ -886,6 +936,20 @@ class ApplicationMarqueurs(tk.Tk):
 
             if os.path.exists(chemin_destination):
                 nb_ignores += 1
+                continue
+
+            # Fichier trop récent = probablement encore en cours d'enregistrement
+            # par OBS : on le laisse tranquille, il sera récupéré au prochain passage.
+            try:
+                age_sec = time.time() - os.path.getmtime(chemin_source)
+            except OSError:
+                age_sec = None
+            if age_sec is not None and age_sec < self.AGE_MINIMUM_FICHIER_SEC:
+                nb_en_cours_enregistrement += 1
+                self._journaliser_depuis_thread(
+                    f"{nom_fichier} modifié il y a {age_sec:.0f}s : probablement encore "
+                    "en cours d'enregistrement, ignoré pour cette fois."
+                )
                 continue
 
             self._journaliser_depuis_thread(f"Copie de {nom_fichier} ...")
@@ -931,6 +995,12 @@ class ApplicationMarqueurs(tk.Tk):
             self._journaliser_depuis_thread(
                 f"{nb_ignores} fichier(s) déjà présent(s) côté réception, ignoré(s)."
             )
+        if nb_en_cours_enregistrement:
+            self._journaliser_depuis_thread(
+                f"{nb_en_cours_enregistrement} fichier(s) probablement encore en cours "
+                "d'enregistrement : relancez la récupération une fois l'enregistrement "
+                "OBS arrêté."
+            )
         if nb_echecs:
             self._journaliser_depuis_thread(
                 f"{nb_echecs} fichier(s) n'ont pas pu être récupérés (voir erreurs ci-dessus). "
@@ -950,8 +1020,7 @@ class ApplicationMarqueurs(tk.Tk):
 
     def _fin_recuperation(self, nouveaux_fichiers):
         self.recuperation_en_cours = False
-        self.bouton_recuperer.config(state="normal")
-        self.bouton_lancer.config(state="normal")
+        self._activer_ui(True)
         self.label_statut.config(text="Récupération terminée.")
         self.zone_progression_recuperation.pack_forget()
 
@@ -964,7 +1033,118 @@ class ApplicationMarqueurs(tk.Tk):
             self._rafraichir_liste()
             self._journaliser(f"{ajoutes} nouveau(x) fichier(s) ajouté(s) à la liste de conversion.")
 
+    # ------------------------------------------------- boîtes de dialogue
+
+    def _confirmer_sombre(self, titre, message, texte_oui="Oui", texte_non="Annuler", danger=False):
+        """Boîte de confirmation oui/non modale au thème de l'application,
+        à la place des messagebox système (qui cassent l'ambiance sombre).
+
+        Retourne True si l'utilisateur confirme, False sinon (bouton Annuler,
+        fermeture de la fenêtre ou touche Échap). Entrée valide le choix par
+        défaut : Annuler (jamais l'action destructive)."""
+        boite = tk.Toplevel(self)
+        boite.title(titre)
+        boite.configure(bg=COULEUR_FOND)
+        boite.resizable(False, False)
+        boite.transient(self)
+
+        resultat = {"valeur": False}
+
+        conteneur = ttk.Frame(boite, padding=20)
+        conteneur.pack(fill="both", expand=True)
+
+        ttk.Label(conteneur, text=titre, style="Titre.TLabel").pack(anchor="w")
+        ttk.Label(
+            conteneur, text=message, justify="left", wraplength=440
+        ).pack(anchor="w", pady=(10, 18))
+
+        barre_boutons = ttk.Frame(conteneur)
+        barre_boutons.pack(fill="x")
+
+        def valider():
+            resultat["valeur"] = True
+            boite.destroy()
+
+        bouton_oui = ttk.Button(
+            barre_boutons,
+            text=texte_oui,
+            style="Danger.TButton" if danger else "Accent.TButton",
+            command=valider,
+        )
+        bouton_oui.pack(side="right")
+        bouton_non = ttk.Button(barre_boutons, text=texte_non, command=boite.destroy)
+        bouton_non.pack(side="right", padx=(0, 8))
+
+        boite.bind("<Escape>", lambda evenement: boite.destroy())
+        boite.bind("<Return>", lambda evenement: boite.destroy())
+        bouton_non.focus_set()
+
+        # Centre la boîte sur la fenêtre principale.
+        boite.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - boite.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - boite.winfo_reqheight()) // 3
+        boite.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        boite.grab_set()
+        self.wait_window(boite)
+        return resultat["valeur"]
+
+    def _informer_sombre(self, titre, message):
+        """Boîte d'information/erreur modale au thème de l'application (un seul
+        bouton OK), remplaçant messagebox.showwarning/showerror système."""
+        boite = tk.Toplevel(self)
+        boite.title(titre)
+        boite.configure(bg=COULEUR_FOND)
+        boite.resizable(False, False)
+        boite.transient(self)
+
+        conteneur = ttk.Frame(boite, padding=20)
+        conteneur.pack(fill="both", expand=True)
+
+        ttk.Label(conteneur, text=titre, style="Titre.TLabel").pack(anchor="w")
+        ttk.Label(
+            conteneur, text=message, justify="left", wraplength=440
+        ).pack(anchor="w", pady=(10, 18))
+
+        bouton_ok = ttk.Button(
+            conteneur, text="OK", style="Accent.TButton", command=boite.destroy
+        )
+        bouton_ok.pack(anchor="e")
+
+        boite.bind("<Escape>", lambda evenement: boite.destroy())
+        boite.bind("<Return>", lambda evenement: boite.destroy())
+        bouton_ok.focus_set()
+
+        boite.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - boite.winfo_reqwidth()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - boite.winfo_reqheight()) // 3
+        boite.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+
+        boite.grab_set()
+        self.wait_window(boite)
+
     # -------------------------------------------------------------- purge
+
+    def _purge_refusee(self, chemin):
+        """Garde-fou : retourne le motif du refus si le chemin est trop dangereux
+        à purger (racine de disque, dossier utilisateur, Bureau/Documents/Vidéos...),
+        sinon None. Évite qu'une mauvaise saisie vide la moitié du PC."""
+        chemin_abs = os.path.normcase(os.path.normpath(os.path.abspath(chemin)))
+        disque, reste = os.path.splitdrive(chemin_abs)
+        composants = [c for c in reste.replace("\\", "/").split("/") if c]
+
+        if not composants:
+            if disque.startswith("\\\\"):
+                return "la racine d'un partage réseau"
+            return "la racine d'un disque"
+
+        profil = os.path.normcase(os.path.normpath(os.path.expanduser("~")))
+        if chemin_abs == profil:
+            return "le dossier utilisateur"
+        if os.path.dirname(chemin_abs) == profil:
+            return "un dossier standard du profil (Bureau, Documents, Vidéos...)"
+
+        return None
 
     def _lancer_purge(self):
         if self.recuperation_en_cours or self.conversion_en_cours or self.purge_en_cours:
@@ -974,7 +1154,7 @@ class ApplicationMarqueurs(tk.Tk):
         destination = self.var_dossier_reception.get().strip()
 
         if not source and not destination:
-            messagebox.showwarning(
+            self._informer_sombre(
                 "Chemins manquants",
                 "Renseignez au moins le dossier source ou le dossier de réception "
                 "avant de purger.",
@@ -984,35 +1164,37 @@ class ApplicationMarqueurs(tk.Tk):
         dossiers_a_purger = []
         for dossier in (source, destination):
             if dossier and os.path.isdir(dossier) and dossier not in dossiers_a_purger:
+                motif_refus = self._purge_refusee(dossier)
+                if motif_refus:
+                    self._informer_sombre(
+                        "Purge refusée",
+                        f"Le dossier suivant ne sera pas purgé car c'est {motif_refus} :\n\n"
+                        f"{dossier}\n\n"
+                        "Choisissez un sous-dossier dédié aux enregistrements.",
+                    )
+                    continue
                 dossiers_a_purger.append(dossier)
 
         if not dossiers_a_purger:
-            messagebox.showerror(
+            self._informer_sombre(
                 "Dossiers introuvables",
-                "Aucun des dossiers renseignés n'est accessible actuellement.",
+                "Aucun des dossiers renseignés n'est accessible (ou autorisé) "
+                "actuellement.",
             )
             return
 
-        liste_dossiers = "\n".join(f"- {dossier}" for dossier in dossiers_a_purger)
-        confirmation = messagebox.askyesno(
+        liste_dossiers = "\n".join(f"•  {dossier}" for dossier in dossiers_a_purger)
+        confirmation = self._confirmer_sombre(
             "Purger les dossiers ?",
-            "Cette action supprime DÉFINITIVEMENT tout le contenu des dossiers "
+            "Cette action supprime définitivement tout le contenu des dossiers "
             "suivants :\n\n"
             f"{liste_dossiers}\n\n"
-            "Ceci est IRRÉVERSIBLE (vidéos comprises). Continuer ?",
-            icon="warning",
+            "C'est irréversible (vidéos comprises).",
+            texte_oui="Oui, tout supprimer",
+            danger=True,
         )
         if not confirmation:
-            return
-
-        saisie = simpledialog.askstring(
-            "Confirmation finale",
-            "Pour confirmer la suppression définitive, tapez SUPPRIMER (en majuscules) "
-            "ci-dessous :",
-            parent=self,
-        )
-        if saisie != "SUPPRIMER":
-            self._journaliser("Purge annulée (confirmation non saisie correctement).")
+            self._journaliser("Purge annulée.")
             return
 
         self.purge_en_cours = True
@@ -1078,7 +1260,7 @@ class ApplicationMarqueurs(tk.Tk):
         try:
             fichiers = core.lister_fichiers_mp4(dossier)
         except ValueError as erreur:
-            messagebox.showwarning("Aucun fichier", str(erreur))
+            self._informer_sombre("Aucun fichier", str(erreur))
             return
 
         ajoutes = 0
@@ -1152,28 +1334,37 @@ class ApplicationMarqueurs(tk.Tk):
                     self._progression_recuperation(contenu)
                 elif type_message == "fin_purge":
                     self._fin_purge()
+                elif type_message == "erreur":
+                    titre, message = contenu
+                    self._informer_sombre(titre, message)
         except queue.Empty:
             pass
         self.after(100, self._traiter_file_attente)
 
     # --------------------------------------------------------- conversion
 
+    def _activer_boutons_liste(self, actif):
+        etat = "normal" if actif else "disabled"
+        for bouton in self.boutons_liste:
+            bouton.config(state=etat)
+
     def _activer_ui(self, actif):
         etat = "normal" if actif else "disabled"
         self.bouton_lancer.config(state=etat)
         self.bouton_recuperer.config(state=etat)
         self.bouton_purger.config(state=etat)
+        self._activer_boutons_liste(actif)
 
     def _lancer_conversion(self):
         if self.conversion_en_cours or self.recuperation_en_cours or self.purge_en_cours:
             return
 
         if not self.fichiers_mp4:
-            messagebox.showwarning("Aucun fichier", "Ajoutez au moins un fichier .mp4.")
+            self._informer_sombre("Aucun fichier", "Ajoutez au moins un fichier .mp4.")
             return
 
         if not self.var_a_cote_source.get() and not self.var_dossier_export.get().strip():
-            messagebox.showwarning(
+            self._informer_sombre(
                 "Dossier d'export manquant",
                 "Choisissez un dossier d'export, ou cochez "
                 "\"Exporter à côté de chaque vidéo source\".",
@@ -1183,20 +1374,23 @@ class ApplicationMarqueurs(tk.Tk):
         try:
             decalage_sec = float(self.var_decalage.get().strip().replace(",", "."))
         except ValueError:
-            messagebox.showwarning(
+            self._informer_sombre(
                 "Décalage invalide",
                 "Le décalage doit être un nombre (ex: 0.75). Utilisation de la valeur "
                 f"par défaut ({core.DECALAGE_PAR_DEFAUT_SEC}s).",
             )
             decalage_sec = core.DECALAGE_PAR_DEFAUT_SEC
+            self.var_decalage.set(str(core.DECALAGE_PAR_DEFAUT_SEC))
 
         chemin_ffprobe = core.trouver_ffprobe()
         if chemin_ffprobe is None:
-            veut_installer = messagebox.askyesno(
+            veut_installer = self._confirmer_sombre(
                 "ffmpeg introuvable",
                 "ffprobe/ffmpeg est introuvable sur ce système.\n\n"
                 "Télécharger automatiquement une version portable "
                 "(nécessite Internet, une seule fois) ?",
+                texte_oui="Télécharger",
+                texte_non="Annuler",
             )
             if not veut_installer:
                 self._journaliser(
