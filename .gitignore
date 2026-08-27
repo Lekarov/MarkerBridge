@@ -1,0 +1,16 @@
+# Cache Python
+__pycache__/
+*.pyc
+
+# Configuration locale (chemins réseau personnels de l'utilisateur) : stockée
+# dans %APPDATA%/DoktorP3st/MarkerBridge depuis la v0.1.1, ne devrait plus
+# apparaître ici, mais on l'ignore par sécurité si une ancienne version l'a
+# recréée à côté du script.
+config_gui.json
+
+# Ancien emplacement du cache ffmpeg portable (versions < 0.1.1) : idem.
+ffmpeg_portable/
+
+# Notes internes de développement (contexte de travail, pas destiné aux
+# utilisateurs du dépôt public).
+CLAUDE.md
